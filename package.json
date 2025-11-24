@@ -1,0 +1,14 @@
+{
+  "name": "digital-tick-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "openai": "^4.0.0"
+  }
+}
