@@ -4,13 +4,13 @@ import OpenAI from 'openai';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // allow image data URLs
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// In-memory usage tracking (per user per month)
+// In-memory usage tracking (per user/IP per month)
 const usageByClient = new Map();
 
 function getClientIp(req) {
@@ -33,27 +33,24 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'digital-tick-ai' });
 });
 
-// Main chat endpoint – Free vs Plus + usage limits
+// Main chat endpoint – Free vs Plus + usage limits + optional image
 app.post('/api/digital-tick-ai', async (req, res) => {
   try {
-    const { messages, plan, userId } = req.body || {};
+    const { messages, plan, userId, image } = req.body || {};
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    // Plan from front end: "free" or "plus"
     const planType = plan === 'plus' ? 'plus' : 'free';
     const isPlus = planType === 'plus';
 
     const monthKey = getMonthKey();
-    // Use real userId where possible; fall back to IP
     const baseKey = userId ? String(userId) : getClientIp(req);
     const usageKey = `${baseKey}:${monthKey}`;
 
     const record = usageByClient.get(usageKey) || { month: monthKey, count: 0 };
 
-    // Enforce 10 questions/month for Free plan only
     const FREE_LIMIT = 10;
     if (!isPlus && record.count >= FREE_LIMIT) {
       return res.json({
@@ -65,7 +62,6 @@ app.post('/api/digital-tick-ai', async (req, res) => {
       });
     }
 
-    // Count this question for Free users
     if (!isPlus) {
       record.count += 1;
       usageByClient.set(usageKey, record);
@@ -95,11 +91,33 @@ For Plus (Expert):
 - Support fibre, broadband, 4G/5G, Starlink, and full-home setups.
 - Include smart-home setup guidance and parental-control/filtering advice.
 - It is fine to ask short follow-up questions to fully diagnose the issue.
+
+If an image (e.g. a screenshot or photo of router lights, app errors, or wiring) is attached, use it alongside the text to give more precise and practical guidance.
 `.trim();
+
+    // Build chat history, upgrading the last user message to include the image if present (Plus only)
+    let chatMessages = [...messages];
+
+    if (image && isPlus && image.dataUrl) {
+      const lastIndex = chatMessages.length - 1;
+      if (lastIndex >= 0) {
+        const last = chatMessages[lastIndex];
+        const lastText =
+          typeof last.content === 'string' ? last.content : '';
+
+        chatMessages[lastIndex] = {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: lastText },
+            { type: 'input_image', image_url: image.dataUrl },
+          ],
+        };
+      }
+    }
 
     const fullInput = [
       { role: 'system', content: systemContent },
-      ...messages,
+      ...chatMessages,
     ];
 
     const response = await client.responses.create({
