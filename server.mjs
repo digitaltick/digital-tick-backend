@@ -28,12 +28,66 @@ function getMonthKey() {
   return `${y}-${m}`; // e.g. "2025-11"
 }
 
+// ---------- Basic request logging (method, path, status, timing) ----------
+app.use((req, res, next) => {
+  const start = Date.now();
+  const ip = getClientIp(req);
+
+  // When the response finishes, log it
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const ts = new Date().toISOString();
+    const plan = (req.body && req.body.plan) || 'unknown';
+
+    console.log(
+      `${ts} ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms ip=${ip} plan=${plan}`
+    );
+  });
+
+  next();
+});
+
 // Health check
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'digital-tick-ai' });
 });
 
-// Main chat endpoint – Free vs Plus + usage limits + optional image
+// ---------- Simple admin usage endpoint (optional) ----------
+// GET /api/admin/usage?key=ADMIN_API_KEY
+app.get('/api/admin/usage', (req, res) => {
+  const adminKey = process.env.ADMIN_API_KEY;
+  if (!adminKey) {
+    return res
+      .status(500)
+      .json({ error: 'ADMIN_API_KEY not configured on server' });
+  }
+
+  const key = req.query.key;
+  if (key !== adminKey) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const monthKey = getMonthKey();
+  const usageSnapshot = [];
+
+  for (const [usageKey, record] of usageByClient.entries()) {
+    if (record.month === monthKey) {
+      usageSnapshot.push({
+        client: usageKey.split(':')[0],
+        month: record.month,
+        count: record.count,
+      });
+    }
+  }
+
+  res.json({
+    month: monthKey,
+    totalClients: usageSnapshot.length,
+    usage: usageSnapshot,
+  });
+});
+
+// ---------- Main chat endpoint – Free vs Plus + usage limits + optional image ----------
 app.post('/api/digital-tick-ai', async (req, res) => {
   try {
     const { messages, plan, userId, image } = req.body || {};
@@ -53,6 +107,9 @@ app.post('/api/digital-tick-ai', async (req, res) => {
 
     const FREE_LIMIT = 10;
     if (!isPlus && record.count >= FREE_LIMIT) {
+      console.log(
+        `[USAGE] Free limit reached for client=${baseKey} month=${monthKey} count=${record.count}`
+      );
       return res.json({
         error: 'Free plan monthly limit reached',
         errorCode: 'FREE_LIMIT_REACHED',
@@ -66,6 +123,12 @@ app.post('/api/digital-tick-ai', async (req, res) => {
       record.count += 1;
       usageByClient.set(usageKey, record);
     }
+
+    console.log(
+      `[CHAT] plan=${planType} client=${baseKey} usedThisMonth=${
+        !isPlus ? record.count : 'N/A (plus)'
+      }`
+    );
 
     const systemContent = `
 You are Digital Tick AI, a professional but friendly assistant helping UK consumers with:
@@ -107,9 +170,15 @@ If an image (e.g. a screenshot or photo of router lights, app errors, or wiring)
 use it alongside the text to give more precise and practical guidance.
 `.trim();
 
-    // Build chat history, upgrading the last user message to include the image if present (Plus only)
+    // ----- Build chat history, with small optimisation on length -----
+    // Keep only the last 8 messages to reduce token load and latency.
     let chatMessages = [...messages];
+    const MAX_HISTORY = 8;
+    if (chatMessages.length > MAX_HISTORY) {
+      chatMessages = chatMessages.slice(chatMessages.length - MAX_HISTORY);
+    }
 
+    // Upgrade the last user message to include the image if present (Plus only)
     if (image && isPlus && image.dataUrl) {
       const lastIndex = chatMessages.length - 1;
       if (lastIndex >= 0) {
@@ -132,9 +201,13 @@ use it alongside the text to give more precise and practical guidance.
       ...chatMessages,
     ];
 
+    const maxOutputTokens = isPlus ? 600 : 300;
+
     const response = await client.responses.create({
       model: 'gpt-4.1-mini',
       input: fullInput,
+      max_output_tokens: maxOutputTokens,
+      temperature: 0.4,
     });
 
     const replyText =
@@ -159,4 +232,3 @@ const port = process.env.PORT || 4000;
 app.listen(port, () => {
   console.log(`Digital Tick AI backend listening on port ${port}`);
 });
-
