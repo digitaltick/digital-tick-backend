@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import OpenAI from 'openai';
+import fs from 'fs/promises';
 
 const app = express();
 app.use(cors());
@@ -10,8 +11,45 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// ---------- Basic JSON logger ----------
+function log(level, event, data = {}) {
+  const logObj = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...data,
+  };
+  console.log(JSON.stringify(logObj));
+}
+
 // In-memory usage tracking (per user/IP per month)
 const usageByClient = new Map();
+const USAGE_FILE = 'usage-data.json';
+
+// ---------- Persistent usage helpers (file-based) ----------
+async function loadUsageFromFile() {
+  try {
+    const data = await fs.readFile(USAGE_FILE, 'utf8');
+    const parsed = JSON.parse(data);
+    usageByClient.clear();
+    for (const [key, record] of Object.entries(parsed)) {
+      usageByClient.set(key, record);
+    }
+    log('info', 'usage_loaded', { entries: usageByClient.size });
+  } catch (err) {
+    log('info', 'usage_init', { message: 'No existing usage file, starting fresh' });
+  }
+}
+
+async function saveUsageToFile() {
+  try {
+    const obj = Object.fromEntries(usageByClient);
+    await fs.writeFile(USAGE_FILE, JSON.stringify(obj), 'utf8');
+    log('info', 'usage_saved', { entries: usageByClient.size });
+  } catch (err) {
+    log('error', 'usage_save_error', { message: err?.message || String(err) });
+  }
+}
 
 function getClientIp(req) {
   const fwd = req.headers['x-forwarded-for'];
@@ -28,26 +66,31 @@ function getMonthKey() {
   return `${y}-${m}`; // e.g. "2025-11"
 }
 
-// ---------- Basic request logging (method, path, status, timing) ----------
+// ---------- Request logging middleware (JSON) ----------
 app.use((req, res, next) => {
   const start = Date.now();
   const ip = getClientIp(req);
 
-  // When the response finishes, log it
   res.on('finish', () => {
     const duration = Date.now() - start;
-    const ts = new Date().toISOString();
     const plan = (req.body && req.body.plan) || 'unknown';
+    const sessionId = (req.body && req.body.sessionId) || 'none';
 
-    console.log(
-      `${ts} ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms ip=${ip} plan=${plan}`
-    );
+    log('info', 'http_request', {
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      duration_ms: duration,
+      ip,
+      plan,
+      sessionId,
+    });
   });
 
   next();
 });
 
-// Health check
+// ---------- Health check ----------
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'digital-tick-ai' });
 });
@@ -87,10 +130,10 @@ app.get('/api/admin/usage', (req, res) => {
   });
 });
 
-// ---------- Main chat endpoint – Free vs Plus + usage limits + optional image ----------
+// ---------- Main chat endpoint ----------
 app.post('/api/digital-tick-ai', async (req, res) => {
   try {
-    const { messages, plan, userId, image } = req.body || {};
+    const { messages, plan, userId, image, sessionId } = req.body || {};
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: 'messages array is required' });
@@ -107,9 +150,13 @@ app.post('/api/digital-tick-ai', async (req, res) => {
 
     const FREE_LIMIT = 10;
     if (!isPlus && record.count >= FREE_LIMIT) {
-      console.log(
-        `[USAGE] Free limit reached for client=${baseKey} month=${monthKey} count=${record.count}`
-      );
+      log('info', 'free_limit_reached', {
+        client: baseKey,
+        month: monthKey,
+        count: record.count,
+        sessionId: sessionId || null,
+      });
+
       return res.json({
         error: 'Free plan monthly limit reached',
         errorCode: 'FREE_LIMIT_REACHED',
@@ -122,13 +169,17 @@ app.post('/api/digital-tick-ai', async (req, res) => {
     if (!isPlus) {
       record.count += 1;
       usageByClient.set(usageKey, record);
+      // Fire-and-forget save (no await to avoid blocking response)
+      saveUsageToFile().catch(() => {});
     }
 
-    console.log(
-      `[CHAT] plan=${planType} client=${baseKey} usedThisMonth=${
-        !isPlus ? record.count : 'N/A (plus)'
-      }`
-    );
+    log('info', 'chat_request', {
+      plan: planType,
+      client: baseKey,
+      usedThisMonth: !isPlus ? record.count : null,
+      month: monthKey,
+      sessionId: sessionId || null,
+    });
 
     const systemContent = `
 You are Digital Tick AI, a professional but friendly assistant helping UK consumers with:
@@ -171,7 +222,6 @@ use it alongside the text to give more precise and practical guidance.
 `.trim();
 
     // ----- Build chat history, with small optimisation on length -----
-    // Keep only the last 8 messages to reduce token load and latency.
     let chatMessages = [...messages];
     const MAX_HISTORY = 8;
     if (chatMessages.length > MAX_HISTORY) {
@@ -213,6 +263,12 @@ use it alongside the text to give more precise and practical guidance.
     const replyText =
       response.output_text || 'Sorry, I could not generate a response.';
 
+    log('info', 'chat_response', {
+      plan: planType,
+      client: baseKey,
+      sessionId: sessionId || null,
+    });
+
     res.json({
       reply: replyText,
       plan: planType,
@@ -220,7 +276,10 @@ use it alongside the text to give more precise and practical guidance.
       allowedPerMonth: !isPlus ? FREE_LIMIT : null,
     });
   } catch (err) {
-    console.error('Digital Tick AI error:', err);
+    log('error', 'chat_error', {
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+    });
     res.status(500).json({
       error: 'Digital Tick AI API error',
       detail: err?.message || String(err),
@@ -229,6 +288,24 @@ use it alongside the text to give more precise and practical guidance.
 });
 
 const port = process.env.PORT || 4000;
+
+// Load usage from file at startup
+loadUsageFromFile().catch(() => {});
+
 app.listen(port, () => {
-  console.log(`Digital Tick AI backend listening on port ${port}`);
+  log('info', 'server_start', { port });
+
+  // Optional keep-warm pings (mostly cosmetic on Starter, but available)
+  if (process.env.KEEP_WARM === 'true') {
+    const KEEP_WARM_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
+    setInterval(() => {
+      fetch(`http://localhost:${port}/api/health`).catch((err) => {
+        log('error', 'keep_warm_error', {
+          message: err?.message || String(err),
+        });
+      });
+    }, KEEP_WARM_INTERVAL_MS);
+
+    log('info', 'keep_warm_enabled', { interval_ms: KEEP_WARM_INTERVAL_MS });
+  }
 });
