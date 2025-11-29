@@ -159,8 +159,12 @@ app.get('/api/admin/usage', (req, res) => {
   });
 });
 
-// ---------- Chat history endpoint for Plus users ----------
-// GET /api/history?userId=...&sessionId=...&latest=true
+// ---------- Chat history endpoints ----------
+
+// GET /api/history?userId=...&sessionId=...&latest=true/false
+// - if sessionId: return that conversation
+// - else if latest (or no latest param): return latest conversation
+// - else: return metadata for all conversations
 app.get('/api/history', (req, res) => {
   const userIdRaw = req.query.userId;
   if (!userIdRaw) {
@@ -206,6 +210,43 @@ app.get('/api/history', (req, res) => {
   }));
 
   return res.json({ conversations: metadata });
+});
+
+// POST /api/history/clear
+// body: { userId, sessionId? }
+// - if sessionId provided: clear that one conversation
+// - else: clear all conversations for the user
+app.post('/api/history/clear', (req, res) => {
+  const { userId, sessionId } = req.body || {};
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  const userKey = String(userId);
+  const sessions = historyByUser.get(userKey);
+  if (!sessions) {
+    return res.json({ cleared: false, message: 'No history for user' });
+  }
+
+  if (sessionId) {
+    if (sessions[sessionId]) {
+      delete sessions[sessionId];
+      if (Object.keys(sessions).length === 0) {
+        historyByUser.delete(userKey);
+      } else {
+        historyByUser.set(userKey, sessions);
+      }
+      saveHistoryToFile().catch(() => {});
+      log('info', 'history_cleared_session', { userId: userKey, sessionId });
+      return res.json({ cleared: true, scope: 'session', sessionId });
+    }
+    return res.json({ cleared: false, message: 'Session not found' });
+  }
+
+  historyByUser.delete(userKey);
+  saveHistoryToFile().catch(() => {});
+  log('info', 'history_cleared_user', { userId: userKey });
+  return res.json({ cleared: true, scope: 'user' });
 });
 
 // ---------- Main chat endpoint ----------
@@ -354,7 +395,6 @@ use it alongside the text to give more precise and practical guidance.
         const sid = sessionId || 'default';
         const nowIso = new Date().toISOString();
 
-        // messages from the client are the full conversation so far
         const updatedMessages = [
           ...messages,
           { role: 'assistant', content: replyText },
@@ -372,6 +412,12 @@ use it alongside the text to give more precise and practical guidance.
 
         existingSessions[sid] = convo;
         historyByUser.set(userKey, existingSessions);
+
+        log('info', 'history_updated', {
+          userId: userKey,
+          sessionId: sid,
+          messageCount: updatedMessages.length,
+        });
 
         // fire-and-forget save
         saveHistoryToFile().catch(() => {});
