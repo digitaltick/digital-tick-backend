@@ -26,6 +26,10 @@ function log(level, event, data = {}) {
 const usageByClient = new Map();
 const USAGE_FILE = 'usage-data.json';
 
+// In-memory chat history (per Plus user, per session)
+const historyByUser = new Map();
+const HISTORY_FILE = 'history-data.json';
+
 // ---------- Persistent usage helpers (file-based) ----------
 async function loadUsageFromFile() {
   try {
@@ -64,6 +68,31 @@ function getMonthKey() {
   const y = now.getUTCFullYear();
   const m = String(now.getUTCMonth() + 1).padStart(2, '0');
   return `${y}-${m}`; // e.g. "2025-11"
+}
+
+// ---------- Persistent history helpers ----------
+async function loadHistoryFromFile() {
+  try {
+    const data = await fs.readFile(HISTORY_FILE, 'utf8');
+    const parsed = JSON.parse(data);
+    historyByUser.clear();
+    for (const [userId, sessions] of Object.entries(parsed)) {
+      historyByUser.set(userId, sessions);
+    }
+    log('info', 'history_loaded', { users: historyByUser.size });
+  } catch (err) {
+    log('info', 'history_init', { message: 'No existing history file, starting fresh' });
+  }
+}
+
+async function saveHistoryToFile() {
+  try {
+    const obj = Object.fromEntries(historyByUser);
+    await fs.writeFile(HISTORY_FILE, JSON.stringify(obj), 'utf8');
+    log('info', 'history_saved', { users: historyByUser.size });
+  } catch (err) {
+    log('error', 'history_save_error', { message: err?.message || String(err) });
+  }
 }
 
 // ---------- Request logging middleware (JSON) ----------
@@ -128,6 +157,55 @@ app.get('/api/admin/usage', (req, res) => {
     totalClients: usageSnapshot.length,
     usage: usageSnapshot,
   });
+});
+
+// ---------- Chat history endpoint for Plus users ----------
+// GET /api/history?userId=...&sessionId=...&latest=true
+app.get('/api/history', (req, res) => {
+  const userIdRaw = req.query.userId;
+  if (!userIdRaw) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  const userId = String(userIdRaw);
+  const sessionId = req.query.sessionId ? String(req.query.sessionId) : null;
+  const latest = req.query.latest === 'true' || req.query.latest === '1';
+
+  const userSessions = historyByUser.get(userId);
+  if (!userSessions) {
+    return res.json({ conversations: [] });
+  }
+
+  const allSessions = Object.values(userSessions);
+
+  if (sessionId) {
+    const conv = userSessions[sessionId];
+    if (!conv) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    return res.json(conv);
+  }
+
+  if (latest || !req.query.latest) {
+    if (allSessions.length === 0) {
+      return res.json({ conversations: [] });
+    }
+    const latestConv = allSessions.reduce((acc, curr) => {
+      if (!acc) return curr;
+      return new Date(curr.updatedAt) > new Date(acc.updatedAt) ? curr : acc;
+    }, null);
+    return res.json(latestConv);
+  }
+
+  // Otherwise return metadata for all conversations
+  const metadata = allSessions.map((c) => ({
+    sessionId: c.sessionId,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    messageCount: Array.isArray(c.messages) ? c.messages.length : 0,
+  }));
+
+  return res.json({ conversations: metadata });
 });
 
 // ---------- Main chat endpoint ----------
@@ -221,7 +299,7 @@ If an image (e.g. a screenshot or photo of router lights, app errors, or wiring)
 use it alongside the text to give more precise and practical guidance.
 `.trim();
 
-    // ----- Build chat history, with small optimisation on length -----
+    // ----- Build chat history for the model (trimmed) -----
     let chatMessages = [...messages];
     const MAX_HISTORY = 8;
     if (chatMessages.length > MAX_HISTORY) {
@@ -269,6 +347,41 @@ use it alongside the text to give more precise and practical guidance.
       sessionId: sessionId || null,
     });
 
+    // ---------- Save chat history for Plus users with an account ----------
+    try {
+      if (isPlus && userId) {
+        const userKey = String(userId);
+        const sid = sessionId || 'default';
+        const nowIso = new Date().toISOString();
+
+        // messages from the client are the full conversation so far
+        const updatedMessages = [
+          ...messages,
+          { role: 'assistant', content: replyText },
+        ];
+
+        const existingSessions = historyByUser.get(userKey) || {};
+        const existingConv = existingSessions[sid];
+
+        const convo = {
+          sessionId: sid,
+          createdAt: existingConv?.createdAt || nowIso,
+          updatedAt: nowIso,
+          messages: updatedMessages,
+        };
+
+        existingSessions[sid] = convo;
+        historyByUser.set(userKey, existingSessions);
+
+        // fire-and-forget save
+        saveHistoryToFile().catch(() => {});
+      }
+    } catch (historyErr) {
+      log('error', 'history_update_error', {
+        message: historyErr?.message || String(historyErr),
+      });
+    }
+
     res.json({
       reply: replyText,
       plan: planType,
@@ -289,8 +402,9 @@ use it alongside the text to give more precise and practical guidance.
 
 const port = process.env.PORT || 4000;
 
-// Load usage from file at startup
+// Load usage & history from file at startup
 loadUsageFromFile().catch(() => {});
+loadHistoryFromFile().catch(() => {});
 
 app.listen(port, () => {
   log('info', 'server_start', { port });
